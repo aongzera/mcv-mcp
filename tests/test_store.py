@@ -134,8 +134,10 @@ def test_courses_are_keyed_by_cv_cid(store):
 
 def test_sync_run_records_failure(store):
     run_id = store.start_sync()
-    store.finish_sync(run_id, ok=False, error="boom")
+    store.finish_sync(run_id, status="error", error="boom")
 
     last = store.last_sync()
     assert last["ok"] == 0
+    assert last["status"] == "error"
     assert last["error"] == "boom"
+    assert last["finished_at"] is not None

@@ -251,6 +251,21 @@ class Store:
             raise
         return counts
 
+    def upsert(
+        self,
+        table: str,
+        rows: Iterable[dict[str, Any]],
+        *,
+        record_events: bool = True,
+    ) -> dict[str, int]:
+        """Insert/update one table's rows in a single transaction. Returns counts.
+
+        For applying a whole sync use apply_sync, which commits all tables at once.
+        """
+        return self.apply_sync(
+            {table: rows}, record_events=record_events, mark_initial_done=False
+        )[table]
+
     def _upsert_rows(
         self,
         table: str,
