@@ -9,10 +9,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import sqlite3
-from datetime import datetime, timezone
+import threading
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, Sequence
+
+log = logging.getLogger(__name__)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS courses (
@@ -83,7 +87,8 @@ CREATE TABLE IF NOT EXISTS sync_runs (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     started_at  TEXT,
     finished_at TEXT,
-    ok          INTEGER,
+    ok          INTEGER,             -- kept for old readers; `status` is authoritative
+    status      TEXT,                -- running | ok | error | stale
     error       TEXT,
     counts      TEXT
 );
@@ -135,15 +140,64 @@ def _hash(row: dict[str, Any], fields: Sequence[str]) -> str:
 
 
 class Store:
+    """Snapshot store, safe to share between the MCP tool threads and the poller.
+
+    Each thread gets its own SQLite connection (WAL mode), so one thread's transaction
+    can never be committed or observed half-done by another. Writes that must be atomic
+    as a group go through explicit BEGIN IMMEDIATE ... COMMIT; everything else is a
+    single autocommitted statement.
+    """
+
+    # A 'running' sync run older than this is presumed dead (process killed mid-run).
+    RUNNING_GRACE = timedelta(minutes=30)
+
     def __init__(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(path, check_same_thread=False)
-        self._conn.row_factory = sqlite3.Row
-        self._conn.executescript(SCHEMA)
-        self._conn.commit()
+        self._path = path
+        self._local = threading.local()
+        self._all_conns: list[sqlite3.Connection] = []
+        self._conns_lock = threading.Lock()
+
+        conn = self._conn
+        conn.executescript(SCHEMA)
+        self._migrate(conn)
+
+    @property
+    def _conn(self) -> sqlite3.Connection:
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            # isolation_level=None -> autocommit; transactions are managed explicitly.
+            conn = sqlite3.connect(
+                self._path, timeout=10, isolation_level=None, check_same_thread=False
+            )
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA busy_timeout=10000")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            self._local.conn = conn
+            with self._conns_lock:
+                self._all_conns.append(conn)
+        return conn
+
+    @staticmethod
+    def _migrate(conn: sqlite3.Connection) -> None:
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(sync_runs)")}
+        if "status" not in cols:
+            conn.execute("ALTER TABLE sync_runs ADD COLUMN status TEXT")
+            # Rows from before the status column: a null finished_at means the run was
+            # never finalized, which we can no longer distinguish from crashed - 'stale'.
+            conn.execute(
+                "UPDATE sync_runs SET status = CASE "
+                "WHEN finished_at IS NULL THEN 'stale' "
+                "WHEN ok = 1 THEN 'ok' ELSE 'error' END"
+            )
 
     def close(self) -> None:
-        self._conn.close()
+        with self._conns_lock:
+            for conn in self._all_conns:
+                conn.close()
+            self._all_conns.clear()
+        self._local = threading.local()
 
     # ------------------------------------------------------------------ meta
 
@@ -157,7 +211,6 @@ class Store:
             "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             (key, value),
         )
-        self._conn.commit()
 
     @property
     def is_first_sync(self) -> bool:
@@ -168,14 +221,47 @@ class Store:
 
     # ------------------------------------------------------------------ upsert
 
-    def upsert(
+    def apply_sync(
+        self,
+        tables: dict[str, Iterable[dict[str, Any]]],
+        *,
+        record_events: bool = True,
+        mark_initial_done: bool = True,
+    ) -> dict[str, dict[str, int]]:
+        """Apply a whole sync's rows in ONE transaction.
+
+        Readers on other connections see either the previous complete snapshot or the
+        new one - never a half-applied sync (WAL readers do not observe uncommitted
+        writes). Returns per-table counts.
+        """
+        conn = self._conn
+        counts: dict[str, dict[str, int]] = {}
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            for table, rows in tables.items():
+                counts[table] = self._upsert_rows(table, rows, record_events=record_events)
+            if mark_initial_done:
+                conn.execute(
+                    "INSERT INTO meta(key, value) VALUES('initial_sync_done', '1') "
+                    "ON CONFLICT(key) DO UPDATE SET value = '1'"
+                )
+            conn.execute("COMMIT")
+        except BaseException:
+            conn.execute("ROLLBACK")
+            raise
+        return counts
+
+    def _upsert_rows(
         self,
         table: str,
         rows: Iterable[dict[str, Any]],
         *,
         record_events: bool = True,
     ) -> dict[str, int]:
-        """Insert/update rows and log new/changed events. Returns counts."""
+        """Insert/update rows and log new/changed events. Returns counts.
+
+        Runs inside the caller's transaction (apply_sync); does not commit.
+        """
         fields = _TRACKED_FIELDS[table]
         key = _KEY_COLUMN.get(table, "id")
         now = utcnow()
@@ -215,7 +301,6 @@ class Store:
                 )
                 unchanged += 1
 
-        self._conn.commit()
         return {"added": added, "changed": changed, "unchanged": unchanged}
 
     def _log_event(self, kind: str, ref_id: str, row: dict[str, Any], when: str) -> None:
@@ -269,7 +354,6 @@ class Store:
             f"({', '.join('?' for _ in event_ids)})",
             list(event_ids),
         )
-        self._conn.commit()
 
     def unnotified_events(self, limit: int = 50) -> list[dict[str, Any]]:
         return self.query(
@@ -279,27 +363,66 @@ class Store:
     # -------------------------------------------------------------- sync runs
 
     def start_sync(self) -> int:
-        cur = self._conn.execute(
-            "INSERT INTO sync_runs(started_at, ok) VALUES(?, 0)", (utcnow(),)
-        )
-        self._conn.commit()
+        conn = self._conn
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            # A run still 'running' when a new one starts was interrupted before it
+            # could finalize (killed process). Label it so callers can tell it apart
+            # from an actually-running sync. If it IS still alive, its own finish_sync
+            # will overwrite this with the real outcome.
+            conn.execute(
+                "UPDATE sync_runs SET status = 'stale', "
+                "error = COALESCE(error, 'never finalized (interrupted?)') "
+                "WHERE status = 'running'"
+            )
+            cur = conn.execute(
+                "INSERT INTO sync_runs(started_at, ok, status) VALUES(?, 0, 'running')",
+                (utcnow(),),
+            )
+            conn.execute("COMMIT")
+        except BaseException:
+            conn.execute("ROLLBACK")
+            raise
         return int(cur.lastrowid or 0)
 
     def finish_sync(
-        self, run_id: int, ok: bool, error: str | None = None, counts: dict | None = None
+        self, run_id: int, status: str, error: str | None = None, counts: dict | None = None
     ) -> None:
-        self._conn.execute(
-            "UPDATE sync_runs SET finished_at = ?, ok = ?, error = ?, counts = ? WHERE id = ?",
-            (utcnow(), 1 if ok else 0, error, json.dumps(counts or {}), run_id),
+        """Finalize a run. `status` is 'ok' or 'error'; the row always gets finished_at."""
+        cur = self._conn.execute(
+            "UPDATE sync_runs SET finished_at = ?, ok = ?, status = ?, error = ?, "
+            "counts = ? WHERE id = ?",
+            (utcnow(), 1 if status == "ok" else 0, status, error, json.dumps(counts or {}), run_id),
         )
-        self._conn.commit()
+        if cur.rowcount != 1:
+            raise RuntimeError(
+                f"finish_sync matched {cur.rowcount} rows for run {run_id}; "
+                "the run record was not finalized"
+            )
 
     def last_sync(self) -> dict[str, Any] | None:
         rows = self.query("SELECT * FROM sync_runs ORDER BY id DESC LIMIT 1")
         return rows[0] if rows else None
 
+    def sync_status(self) -> dict[str, Any]:
+        """Freshness info for read responses: is a sync running, and when one last completed."""
+        last = self.last_sync()
+        in_progress = False
+        if last and last.get("status") == "running":
+            try:
+                started = datetime.fromisoformat(str(last["started_at"]))
+                in_progress = datetime.now(timezone.utc) - started < self.RUNNING_GRACE
+            except (TypeError, ValueError):
+                in_progress = True
+        completed = self.query(
+            "SELECT finished_at FROM sync_runs WHERE status = 'ok' ORDER BY id DESC LIMIT 1"
+        )
+        return {
+            "sync_in_progress": in_progress,
+            "last_completed_sync": completed[0]["finished_at"] if completed else None,
+        }
+
     def set_material_local_path(self, material_id: str, path: str) -> None:
         self._conn.execute(
             "UPDATE materials SET local_path = ? WHERE id = ?", (path, material_id)
         )
-        self._conn.commit()

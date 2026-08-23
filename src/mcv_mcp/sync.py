@@ -27,15 +27,36 @@ class Syncer:
         self._client = client
         self._store = store
         self._config = config
+        # One sync at a time per process: sync_now racing the poller would double-fetch
+        # and interleave two runs' records.
+        self._sync_lock = threading.Lock()
 
     def sync_once(self, full: bool = False) -> dict[str, Any]:
         """Refresh the snapshot. `full` walks every semester, not just the current one."""
+        if not self._sync_lock.acquire(blocking=False):
+            return {
+                "ok": False,
+                "in_progress": True,
+                "error": "a sync is already running in this process",
+            }
+        try:
+            return self._sync_locked(full)
+        finally:
+            self._sync_lock.release()
+
+    def _sync_locked(self, full: bool) -> dict[str, Any]:
         run_id = self._store.start_sync()
         # On the very first run everything would look "new"; backfill quietly instead.
         record_events = not self._store.is_first_sync
         counts: dict[str, Any] = {}
+        # Defaults describe the worst case; overwritten just before the successful
+        # return, so the finally block always records a truthful outcome - even if
+        # the thread dies to a BaseException (process shutdown, KeyboardInterrupt).
+        status = "error"
+        error: str | None = "interrupted before completion"
 
         try:
+            # ---- fetch phase: network only, no DB writes ----
             self._client.ensure_login()
             semesters = self._client.get_semesters()
             if not semesters:
@@ -57,10 +78,6 @@ class Syncer:
                             "raw": str(course),
                         }
                     )
-
-            counts["courses"] = self._store.upsert(
-                "courses", courses, record_events=record_events
-            )
 
             assignments: list[dict[str, Any]] = []
             materials: list[dict[str, Any]] = []
@@ -112,25 +129,33 @@ class Syncer:
 
             self._fill_descriptions(assignments, refetch=full)
 
-            counts["assignments"] = self._store.upsert(
-                "assignments", assignments, record_events=record_events
-            )
-            counts["materials"] = self._store.upsert(
-                "materials", materials, record_events=record_events
-            )
-            counts["grades"] = self._store.upsert(
-                "grades", grades, record_events=record_events
+            # ---- apply phase: everything lands in one transaction, so readers see
+            # the previous complete snapshot or the new one, never a partial sync ----
+            counts = self._store.apply_sync(
+                {
+                    "courses": courses,
+                    "assignments": assignments,
+                    "materials": materials,
+                    "grades": grades,
+                },
+                record_events=record_events,
             )
 
-            self._store.mark_initial_sync_done()
-            self._store.finish_sync(run_id, ok=True, counts=counts)
+            status, error = "ok", None
             log.info("sync ok: %s", counts)
             return {"ok": True, "backfill": not record_events, "counts": counts}
 
         except Exception as exc:  # surfaced through auth_status / sync_now
-            self._store.finish_sync(run_id, ok=False, error=str(exc), counts=counts)
+            status, error = "error", str(exc)
             log.warning("sync failed: %s", exc)
-            return {"ok": False, "error": str(exc), "counts": counts}
+            return {"ok": False, "error": error, "counts": counts}
+
+        finally:
+            try:
+                self._store.finish_sync(run_id, status=status, error=error, counts=counts)
+            except Exception:
+                # Never let bookkeeping mask the sync result / original exception.
+                log.exception("could not finalize sync run %s", run_id)
 
     def _safely(self, fetch, cv_cid: str, what: str) -> list[dict[str, Any]]:
         """One course failing (no access, MCV hiccup) must not abort the whole sync."""
@@ -193,7 +218,13 @@ class Poller:
     def _run(self) -> None:
         backoff = 1
         while not self._stop.is_set():
-            result = self._syncer.sync_once()
+            try:
+                result = self._syncer.sync_once()
+            except Exception:
+                # sync_once handles its own errors; this guards the thread itself -
+                # an escaped exception here would kill the poller silently.
+                log.exception("poller: sync crashed")
+                result = {"ok": False}
             if result.get("ok"):
                 backoff = 1
                 delay = self._interval
@@ -211,5 +242,8 @@ def run_forever(config: Config) -> None:
     with MCVClient(config) as client:
         syncer = Syncer(client, store, config)
         while True:
-            syncer.sync_once()
+            try:
+                syncer.sync_once()
+            except Exception:
+                log.exception("standalone poller: sync crashed")
             time.sleep(max(10, config.poll_minutes) * 60)

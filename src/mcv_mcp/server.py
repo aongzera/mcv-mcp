@@ -74,6 +74,21 @@ def _parse_since(since: str | None, default_days: int = 7) -> str:
     return parsed.isoformat(timespec="seconds")
 
 
+def _freshness() -> dict[str, Any]:
+    """Staleness signal attached to every read so a mid-sync answer is never silent."""
+    status = store.sync_status()
+    fresh: dict[str, Any] = {
+        "sync_in_progress": status["sync_in_progress"],
+        "last_completed_sync": status["last_completed_sync"],
+    }
+    if status["sync_in_progress"]:
+        fresh["warning"] = (
+            "a sync is running right now; this answer reflects the previous "
+            "completed sync and may be missing very recent items"
+        )
+    return fresh
+
+
 # ---------------------------------------------------------------- what's new
 
 
@@ -107,6 +122,7 @@ def whats_new(since: str | None = None, kinds: str | None = None, limit: int = 5
             "'detected_at' is when this server first saw the item, which is the best "
             "available proxy - MCV does not expose a reliable posted-at timestamp."
         ),
+        **_freshness(),
     }
 
 
@@ -131,7 +147,12 @@ def list_upcoming_deadlines(within_days: int = 7, include_undated: bool = True) 
             "WHERE a.due_at IS NULL AND a.due_text != '' ORDER BY a.last_changed DESC"
         )
 
-    return {"within_days": within_days, "count": len(rows), "assignments": [_assignment(r) for r in rows]}
+    return {
+        "within_days": within_days,
+        "count": len(rows),
+        "assignments": [_assignment(r) for r in rows],
+        **_freshness(),
+    }
 
 
 # ------------------------------------------------------------------- reads
@@ -155,6 +176,7 @@ def list_courses(yearsem: str | None = None) -> dict:
             }
             for r in rows
         ],
+        **_freshness(),
     }
 
 
@@ -178,7 +200,7 @@ def list_assignments(cv_cid: str | None = None, include_past: bool = False) -> d
     sql += " ORDER BY a.due_at IS NULL, a.due_at ASC"
 
     rows = store.query(sql, params)
-    return {"count": len(rows), "assignments": [_assignment(r) for r in rows]}
+    return {"count": len(rows), "assignments": [_assignment(r) for r in rows], **_freshness()}
 
 
 @mcp.tool()
@@ -190,8 +212,8 @@ def get_assignment(assignment_id: str) -> dict:
         (assignment_id,),
     )
     if not rows:
-        return {"found": False, "error": f"no assignment with id {assignment_id!r}"}
-    return {"found": True, "assignment": _assignment(rows[0])}
+        return {"found": False, "error": f"no assignment with id {assignment_id!r}", **_freshness()}
+    return {"found": True, "assignment": _assignment(rows[0]), **_freshness()}
 
 
 @mcp.tool()
@@ -217,6 +239,7 @@ def list_materials(cv_cid: str | None = None) -> dict:
             }
             for r in rows
         ],
+        **_freshness(),
     }
 
 
@@ -302,7 +325,7 @@ def list_grades(cv_cid: str | None = None, released_only: bool = False) -> dict:
     if released_only:
         grades = [g for g in grades if g["released"]]
 
-    return {"count": len(grades), "grades": grades}
+    return {"count": len(grades), "grades": grades, **_freshness()}
 
 
 # ------------------------------------------------------------- housekeeping
@@ -332,6 +355,7 @@ def auth_status() -> dict:
         "initial_sync_done": not store.is_first_sync,
         "last_sync": last,
         "row_counts": counts,
+        **_freshness(),
     }
 
 
