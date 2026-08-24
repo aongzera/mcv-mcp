@@ -332,6 +332,128 @@ def _material(
     }
 
 
+# -------------------------------------------------------------- announcements
+
+
+_VIEW_ANNOUNCEMENT_RE = re.compile(r"View announcement titled\s+(.+?)\s*$", re.I)
+_CONTENT_NODE_ID_RE = re.compile(r"view_content_node_(\d+)")
+
+# The date column renders '18 Aug 26' - day, English month, two-digit CE year.
+_POSTED_FORMATS = ("%d %b %y", "%d %B %y", "%d %b %Y", "%d %B %Y")
+
+
+def parse_announcements(html: str, cv_cid: str) -> list[dict[str, Any]]:
+    """Announcements from a course home page's 'Announcements' section.
+
+    Each row is a post date plus a link to the announcement's own page; the full text
+    lives on that page, so `body` is left empty here and filled in by the syncer via
+    parse_announcement_body().
+    """
+    soup = _soup(html)
+    section = soup.select_one(
+        "#courseville-announcement-list, #courseville-course-home-announcement"
+    )
+    if section is None:
+        return []
+
+    results: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    for row in section.find_all("tr"):
+        link = row.find("a", href=_CONTENT_NODE_ID_RE)
+        if link is None:
+            continue
+        href = str(link["href"])
+        # `content_id` is MCV's own content-node id; the href carries it too.
+        item_id = _clean(str(link.get("content_id", "")))
+        if not item_id:
+            match = _CONTENT_NODE_ID_RE.search(href)
+            item_id = match.group(1) if match else ""
+
+        # The visible anchor text can be elided; the aria-label carries the full title.
+        title = ""
+        label = _VIEW_ANNOUNCEMENT_RE.search(str(link.get("aria-label", "")))
+        if label:
+            title = _clean(label.group(1))
+        if not title:
+            title = _clean(link.get_text())
+        if not item_id or not title or item_id in seen:
+            continue
+        seen.add(item_id)
+
+        date_node = row.select_one(".courseville-post-date")
+        posted_at, posted_text = _parse_posted(
+            date_node.get_text() if date_node else ""
+        )
+
+        results.append(
+            {
+                "id": f"{cv_cid}:{item_id}",
+                "cv_cid": cv_cid,
+                "item_id": item_id,
+                "title": title,
+                "body": "",
+                "posted_at": posted_at,
+                "posted_text": posted_text,
+                "url": _absolute_url(href),
+            }
+        )
+
+    return results
+
+
+def _parse_posted(text: str) -> tuple[str | None, str]:
+    """The announcement date column -> (ISO-8601 UTC or None, original text).
+
+    No time of day is shown, so midnight Bangkok is assumed. A parse that lands before
+    2000 means the format guess went wrong (e.g. a Buddhist-era rendering); better no
+    timestamp than a wrong one - the original text is always kept.
+    """
+    cleaned = _clean(text)
+    if not cleaned:
+        return None, ""
+    for fmt in _POSTED_FORMATS:
+        try:
+            parsed = datetime.strptime(cleaned, fmt)
+        except ValueError:
+            continue
+        if parsed.year < 2000:
+            break
+        as_utc = parsed.replace(tzinfo=BANGKOK).astimezone(timezone.utc)
+        return as_utc.isoformat(timespec="seconds"), cleaned
+    return None, cleaned
+
+
+def parse_announcement_body(html: str) -> str:
+    """The full text from one announcement's own page (view_content_node_<id>).
+
+    The page gives the announcement's <section> no id of its own; the acknowledge box
+    and the 'Last modified' line inside it are the reliable anchors. Both are page
+    chrome, not content, so they are dropped along with the section's title bar (which
+    repeats the title the list already provides).
+    """
+    soup = _soup(html)
+    anchor = soup.select_one(
+        ".courseville-view-content-modification-info, "
+        ".courseville-content-panel-acknowledge-div"
+    )
+    section = anchor.find_parent("section") if anchor is not None else None
+    if section is None:
+        return ""
+
+    for node in section.select(
+        ".courseville-content-panel-acknowledge-div, "
+        ".courseville-view-content-modification-info, script, style"
+    ):
+        node.decompose()
+    title_bar = section.find("div", class_="cvui-section-title", recursive=False)
+    if title_bar is not None:
+        title_bar.decompose()
+
+    lines = [_clean(line) for line in section.get_text("\n").splitlines()]
+    return "\n".join(line for line in lines if line)
+
+
 # ---------------------------------------------------- assignments and grades
 
 

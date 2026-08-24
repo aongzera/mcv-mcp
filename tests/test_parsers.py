@@ -12,6 +12,8 @@ from datetime import datetime, timezone
 from mcv_mcp.parsers import (
     is_released,
     parse_active_panel,
+    parse_announcement_body,
+    parse_announcements,
     parse_assignments,
     parse_due_text,
     parse_grades,
@@ -328,3 +330,121 @@ class TestGrades:
 
     def test_empty(self):
         assert parse_grades("", "1") == []
+
+
+# Trimmed from a real course home page: the announcements section above the materials.
+ANNOUNCEMENTS = """
+<section id="courseville-announcement-list" aria-label="Course announcements" class="cvui-margin-v">
+ <div class="cvui-section-title"><h2 tabindex="0">Announcements</h2></div>
+ <div id="courseville-course-home-announcement">
+  <table aria-label="Course announcements" class="courseville-table">
+   <tr>
+    <td style="width:80px;"><span class="courseville-post-date">18 Aug 26</span></td>
+    <td><a href="?q=courseville/course/86405/view_content_node_2151263"
+           class="cvui-link-look courseville-viewable-content-link cvnav-ajaxnav"
+           sub_page="view_content_node_2151263" content_id="2151263"
+           aria-label="View announcement titled Review Questions #3 has been published. Submission deadline is Sunday (30 Aug 2026). กดส่งได้แค่ครั้งเดียว"
+           >Review Questions #3 has been published. Submission deadline is Sunday (30 Aug 2026). กดส่งได้แค่ครั้งเดียว</a></td>
+    <td class="courseville-action-col">
+      <button class="cv-fa-button cv-datacopy-button"
+              data-data="https://www.mycourseville.com?q=courseville/course/86405/view_content_node_2151263"
+              aria-label="Copy the link (URL) to this announcement"><i class="fa fa-share-alt"></i></button>
+    </td>
+   </tr>
+   <tr>
+    <td style="width:80px;"><span class="courseville-post-date">18 Aug 26</span></td>
+    <td><a href="?q=courseville/course/86405/view_content_node_2151259"
+           class="cvui-link-look courseville-viewable-content-link cvnav-ajaxnav"
+           sub_page="view_content_node_2151259" content_id="2151259"
+           aria-label="View announcement titled ประกาศ เฉพาะคลาสจันทร์หน้า วันที่ 24 ส.ค. 69"
+           >ประกาศ เฉพาะคลาสจันทร์หน้า วันที่ 24 ส.ค. 69</a></td>
+    <td class="courseville-action-col"></td>
+   </tr>
+  </table>
+ </div>
+</section>
+"""
+
+
+class TestAnnouncements:
+    def test_reads_date_title_id_and_url(self):
+        rows = parse_announcements(ANNOUNCEMENTS, "86405")
+        assert len(rows) == 2
+
+        first = rows[0]
+        assert first["id"] == "86405:2151263"
+        assert first["item_id"] == "2151263"
+        assert first["title"].startswith("Review Questions #3 has been published.")
+        # '18 Aug 26', midnight Bangkok (UTC+7) -> 17:00 UTC the previous day.
+        assert first["posted_at"] == "2026-08-17T17:00:00+00:00"
+        assert first["posted_text"] == "18 Aug 26"
+        assert first["url"].endswith("?q=courseville/course/86405/view_content_node_2151263")
+
+    def test_thai_titles_survive(self):
+        rows = parse_announcements(ANNOUNCEMENTS, "86405")
+        assert rows[1]["title"] == "ประกาศ เฉพาะคลาสจันทร์หน้า วันที่ 24 ส.ค. 69"
+
+    def test_body_is_left_for_the_detail_fetch(self):
+        assert parse_announcements(ANNOUNCEMENTS, "86405")[0]["body"] == ""
+
+    def test_id_is_stable(self):
+        assert [r["id"] for r in parse_announcements(ANNOUNCEMENTS, "86405")] == [
+            r["id"] for r in parse_announcements(ANNOUNCEMENTS, "86405")
+        ]
+
+    def test_page_without_the_section(self):
+        assert parse_announcements("<html><body>nothing</body></html>", "1") == []
+
+    def test_empty(self):
+        assert parse_announcements("", "1") == []
+
+
+# Trimmed from a real view_content_node page (an announcement opened from the list).
+ANNOUNCEMENT_DETAIL = """
+<div id="courseville-content-course-main-column">
+<section aria-label="Review Questions #3 has been published." title="Review Questions #3 has been published.">
+  <div class="cvui-section-title"><h2>Review Questions #3 has been published. Submission deadline is Sunday (30 Aug 2026). กดส่งได้แค่ครั้งเดียว</h2></div>
+  <aside class="courseville-content-panel-acknowledge-div" aria-label="My acknowledgement of this item.">
+    Be the first to acknowledge this.
+    <div class="courseville-content-panel-acknowledge-list"></div>
+  </aside>
+  <div class="courseville-view-content-modification-info">Last modified: 18 Aug 2026</div>
+  <div class="cvui-margin-v">
+    <div class="cvui-section-title" style="font-weight:bold;">
+      <h2><span>Review Questions #3</span><span> has been published.</span></h2>
+    </div>
+    <div class="cvui-margin-v">
+      <p style="margin:0px 0px 10px;">Submission deadline is Sunday (30 Aug 2026).</p>
+      <p style="margin:0px 0px 10px;">Students who submit late (within 31 Aug 2026) will get half of the score.</p>
+      <p style="margin:0px 0px 10px;">NOTE: Each student can ONLY submit ONCE.</p>
+    </div>
+  </div>
+</section>
+</div>
+"""
+
+
+class TestAnnouncementBody:
+    def test_reads_the_body_paragraphs(self):
+        body = parse_announcement_body(ANNOUNCEMENT_DETAIL)
+        assert "Submission deadline is Sunday (30 Aug 2026)." in body
+        assert "half of the score" in body
+        assert "ONLY submit ONCE" in body
+
+    def test_page_chrome_is_dropped(self):
+        body = parse_announcement_body(ANNOUNCEMENT_DETAIL)
+        assert "acknowledge" not in body.lower()
+        assert "Last modified" not in body
+
+    def test_outer_title_bar_is_dropped_but_inline_heading_kept(self):
+        body = parse_announcement_body(ANNOUNCEMENT_DETAIL)
+        # The section's own title bar repeats the list title - dropped; the heading
+        # inside the body is the instructor's content - kept.
+        assert "กดส่งได้แค่ครั้งเดียว" not in body
+        assert "Review Questions #3" in body
+
+    def test_missing(self):
+        assert parse_announcement_body("<html></html>") == ""
+
+    def test_empty(self):
+        assert parse_announcement_body("") == ""

@@ -98,7 +98,8 @@ def whats_new(since: str | None = None, kinds: str | None = None, limit: int = 5
 
     Args:
         since: ISO date, a relative span like '3d' / '12h', or 'yesterday'. Default 7 days.
-        kinds: comma-separated filter, e.g. 'assignment_new,grade_new'. Default all.
+        kinds: comma-separated filter, e.g. 'assignment_new,announcement_new,grade_new'.
+            Default all.
         limit: max events to return.
     """
     since_iso = _parse_since(since)
@@ -214,6 +215,58 @@ def get_assignment(assignment_id: str) -> dict:
     if not rows:
         return {"found": False, "error": f"no assignment with id {assignment_id!r}", **_freshness()}
     return {"found": True, "assignment": _assignment(rows[0]), **_freshness()}
+
+
+@mcp.tool()
+def list_announcements(cv_cid: str | None = None, since: str | None = None, limit: int = 50) -> dict:
+    """Course announcements posted by instructors, newest first.
+
+    Args:
+        cv_cid: filter to one course.
+        since: ISO date, a relative span like '3d' / '12h', or 'yesterday'. Default: all.
+        limit: max announcements to return.
+    """
+    sql = (
+        "SELECT a.*, c.title AS course_title, c.course_no "
+        "FROM announcements a LEFT JOIN courses c ON c.cv_cid = a.cv_cid"
+    )
+    params: list[Any] = []
+    where = []
+    if cv_cid:
+        where.append("a.cv_cid = ?")
+        params.append(str(cv_cid))
+    if since:
+        # posted_at can be NULL (unparseable date); fall back to when we first saw it.
+        where.append("COALESCE(a.posted_at, a.first_seen) >= ?")
+        params.append(_parse_since(since))
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY COALESCE(a.posted_at, a.first_seen) DESC LIMIT ?"
+    params.append(limit)
+
+    rows = store.query(sql, params)
+    return {
+        "count": len(rows),
+        "announcements": [_announcement(r) for r in rows],
+        **_freshness(),
+    }
+
+
+@mcp.tool()
+def get_announcement(announcement_id: str) -> dict:
+    """Full detail for one announcement. `announcement_id` is '<cv_cid>:<content_id>'."""
+    rows = store.query(
+        "SELECT a.*, c.title AS course_title, c.course_no "
+        "FROM announcements a LEFT JOIN courses c ON c.cv_cid = a.cv_cid WHERE a.id = ?",
+        (announcement_id,),
+    )
+    if not rows:
+        return {
+            "found": False,
+            "error": f"no announcement with id {announcement_id!r}",
+            **_freshness(),
+        }
+    return {"found": True, "announcement": _announcement(rows[0]), **_freshness()}
 
 
 @mcp.tool()
@@ -343,7 +396,7 @@ def auth_status() -> dict:
     last = store.last_sync()
     counts = {
         table: store.query(f"SELECT COUNT(*) AS n FROM {table}")[0]["n"]
-        for table in ("courses", "assignments", "materials", "grades", "events")
+        for table in ("courses", "assignments", "materials", "announcements", "grades", "events")
     }
     return {
         "credentials_configured": config.has_credentials,
@@ -356,6 +409,20 @@ def auth_status() -> dict:
         "last_sync": last,
         "row_counts": counts,
         **_freshness(),
+    }
+
+
+def _announcement(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "course": row.get("course_title") or row["cv_cid"],
+        "course_no": row.get("course_no"),
+        "title": row["title"],
+        "body": row["body"],
+        "posted_at": row["posted_at"],
+        "posted_text": row["posted_text"],
+        "url": row["url"],
+        "first_seen": row["first_seen"],
     }
 
 

@@ -59,6 +59,21 @@ CREATE TABLE IF NOT EXISTS materials (
     last_changed TEXT
 );
 
+CREATE TABLE IF NOT EXISTS announcements (
+    id          TEXT PRIMARY KEY,   -- '<cv_cid>:<content_id>'
+    cv_cid      TEXT,
+    item_id     TEXT,
+    title       TEXT,
+    body        TEXT,
+    posted_at   TEXT,               -- ISO-8601, may be NULL (no time on the page)
+    posted_text TEXT,               -- original date string as MCV showed it
+    url         TEXT,
+    content_hash TEXT,
+    first_seen  TEXT,
+    last_seen   TEXT,
+    last_changed TEXT
+);
+
 CREATE TABLE IF NOT EXISTS grades (
     id          TEXT PRIMARY KEY,   -- '<cv_cid>:<item_id>'
     cv_cid      TEXT,
@@ -101,6 +116,7 @@ CREATE TABLE IF NOT EXISTS meta (
 CREATE INDEX IF NOT EXISTS idx_events_detected ON events(detected_at);
 CREATE INDEX IF NOT EXISTS idx_assignments_course ON assignments(cv_cid);
 CREATE INDEX IF NOT EXISTS idx_materials_course ON materials(cv_cid);
+CREATE INDEX IF NOT EXISTS idx_announcements_course ON announcements(cv_cid);
 CREATE INDEX IF NOT EXISTS idx_grades_course ON grades(cv_cid);
 """
 
@@ -110,6 +126,7 @@ _TRACKED_FIELDS: dict[str, Sequence[str]] = {
     "courses": ("course_no", "title", "yearsem"),
     "assignments": ("title", "description", "due_at", "due_text", "url"),
     "materials": ("folder", "name", "url"),
+    "announcements": ("title", "body", "posted_at", "posted_text", "url"),
     "grades": ("item_title", "score", "max_score"),
 }
 
@@ -119,12 +136,14 @@ _KEY_COLUMN: dict[str, str] = {"courses": "cv_cid"}
 _NEW_EVENT = {
     "assignments": "assignment_new",
     "materials": "material_new",
+    "announcements": "announcement_new",
     "grades": "grade_new",
     "courses": "course_new",
 }
 _CHANGED_EVENT = {
     "assignments": "assignment_changed",
     "materials": "material_changed",
+    "announcements": "announcement_changed",
     "grades": "grade_changed",
     "courses": "course_changed",
 }
@@ -227,19 +246,25 @@ class Store:
         *,
         record_events: bool = True,
         mark_initial_done: bool = True,
+        quiet_tables: Sequence[str] = (),
     ) -> dict[str, dict[str, int]]:
         """Apply a whole sync's rows in ONE transaction.
 
         Readers on other connections see either the previous complete snapshot or the
         new one - never a half-applied sync (WAL readers do not observe uncommitted
         writes). Returns per-table counts.
+
+        `quiet_tables` suppresses events for just those tables - used to backfill a
+        table introduced after the initial sync without reporting old rows as news.
         """
         conn = self._conn
         counts: dict[str, dict[str, int]] = {}
         conn.execute("BEGIN IMMEDIATE")
         try:
             for table, rows in tables.items():
-                counts[table] = self._upsert_rows(table, rows, record_events=record_events)
+                counts[table] = self._upsert_rows(
+                    table, rows, record_events=record_events and table not in quiet_tables
+                )
             if mark_initial_done:
                 conn.execute(
                     "INSERT INTO meta(key, value) VALUES('initial_sync_done', '1') "
