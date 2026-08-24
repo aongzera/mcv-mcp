@@ -1,8 +1,8 @@
 # MyCourseVille MCP Server
 
 An MCP server that gives an AI agent access to your [MyCourseVille](https://www.mycourseville.com)
-account: new assignments with their deadlines and descriptions, course materials, and
-released grades — plus a "what changed since last time" feed.
+account: new assignments with their deadlines and descriptions, course announcements,
+course materials, and released grades — plus a "what changed since last time" feed.
 
 Personal tool for your own account data. Keep the poll interval polite and never commit
 your credentials.
@@ -13,8 +13,8 @@ MCV has an official OAuth2 API (`/api/v1/public/get/*`), but it requires registe
 app to get a `client_id`/`client_secret`, and its endpoint names aren't publicly
 documented. This server instead logs in exactly like the MCV web client does — through the
 IT Chula SSO button by default, or the plain MCV form — then reads the same server-rendered
-course pages the site serves to a browser: the course home for materials, `/assignment` for
-deadlines, and `/portfolio-<student id>` for scores. See
+course pages the site serves to a browser: the course home for announcements and
+materials, `/assignment` for deadlines, and `/portfolio-<student id>` for scores. See
 [docs/ENDPOINTS.md](docs/ENDPOINTS.md).
 
 Fetched data lands in a local SQLite snapshot. Every sync diffs against that snapshot and
@@ -50,11 +50,13 @@ Then ask: *"What's due this week?"*, *"Anything new on MCV since yesterday?"*,
 
 | Tool | What it answers |
 |---|---|
-| `whats_new` | New/changed assignments, materials and grades since a point in time |
+| `whats_new` | New/changed assignments, announcements, materials and grades since a point in time |
 | `list_upcoming_deadlines` | What's due in the next N days, soonest first |
 | `list_courses` | Enrolled courses, optionally one semester |
 | `list_assignments` | Assignments with deadline + description |
 | `get_assignment` | Full detail for one assignment |
+| `list_announcements` | Instructor announcements, newest first, with their full text |
+| `get_announcement` | Full detail for one announcement |
 | `list_materials` | Files posted in a course (folder, name, URL) |
 | `download_material` | Save a file locally; extracts PDF text so it can be read |
 | `list_grades` | Released scores |

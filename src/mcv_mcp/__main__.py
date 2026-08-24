@@ -37,9 +37,9 @@ def _selftest(full: bool) -> int:
             print(f"error     : {result.get('error')}")
         print(json.dumps(result.get("counts", {}), indent=2))
 
-        for table in ("courses", "assignments", "materials", "grades"):
+        for table in ("courses", "assignments", "materials", "announcements", "grades"):
             n = store.query(f"SELECT COUNT(*) AS n FROM {table}")[0]["n"]
-            print(f"{table:<11}: {n}")
+            print(f"{table:<13}: {n}")
 
     return 0 if result.get("ok") else 1
 

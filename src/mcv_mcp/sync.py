@@ -12,6 +12,8 @@ from .client import MCVClient, MCVError
 from .config import Config
 from .parsers import (
     parse_active_panel,
+    parse_announcement_body,
+    parse_announcements,
     parse_assignments,
     parse_grades,
     parse_materials,
@@ -81,15 +83,30 @@ class Syncer:
 
             assignments: list[dict[str, Any]] = []
             materials: list[dict[str, Any]] = []
+            announcements: list[dict[str, Any]] = []
             grades: list[dict[str, Any]] = []
 
             for course in courses:
                 cv_cid = course["cv_cid"]
+                # The course home page carries both the announcement list and the
+                # materials, so it is fetched once and parsed twice.
+                try:
+                    home_html = self._client.get_course_page(cv_cid)
+                except MCVError as exc:
+                    log.warning("course %s: could not read home page: %s", cv_cid, exc)
+                    home_html = ""
                 materials.extend(
                     self._safely(
-                        lambda: parse_materials(self._client.get_course_page(cv_cid), cv_cid),
+                        lambda: parse_materials(home_html, cv_cid),
                         cv_cid,
                         "materials",
+                    )
+                )
+                announcements.extend(
+                    self._safely(
+                        lambda: parse_announcements(home_html, cv_cid),
+                        cv_cid,
+                        "announcements",
                     )
                 )
                 assignments.extend(
@@ -129,6 +146,14 @@ class Syncer:
 
             self._fill_descriptions(assignments, refetch=full)
 
+            # An empty announcements table means this is the table's own first fill
+            # (it shipped after the initial sync): backfill it quietly, the same way
+            # the very first sync backfills everything.
+            announcements_backfill = (
+                self._store.query("SELECT COUNT(*) AS n FROM announcements")[0]["n"] == 0
+            )
+            self._fill_bodies(announcements, refetch=full)
+
             # ---- apply phase: everything lands in one transaction, so readers see
             # the previous complete snapshot or the new one, never a partial sync ----
             counts = self._store.apply_sync(
@@ -136,9 +161,11 @@ class Syncer:
                     "courses": courses,
                     "assignments": assignments,
                     "materials": materials,
+                    "announcements": announcements,
                     "grades": grades,
                 },
                 record_events=record_events,
+                quiet_tables=("announcements",) if announcements_backfill else (),
             )
 
             status, error = "ok", None
@@ -195,6 +222,35 @@ class Syncer:
                 row["description"] = known.get(row["id"], "")
                 continue
             row["description"] = parse_worksheet_description(html)
+
+    def _fill_bodies(
+        self, announcements: list[dict[str, Any]], refetch: bool = False
+    ) -> None:
+        """Add each announcement's full text, fetched from its own page.
+
+        Same economics as _fill_descriptions: one request per announcement, but only
+        for ones not seen before, so a steady-state poll costs nothing extra. An empty
+        body is a real answer (some announcements are title-only) and is cached too.
+        `refetch` (a full sync) picks up edits made after an announcement was posted.
+        """
+        known = {
+            row["id"]: row["body"]
+            for row in self._store.query("SELECT id, body FROM announcements")
+        }
+
+        for row in announcements:
+            if not refetch and row["id"] in known:
+                row["body"] = known[row["id"]]
+                continue
+            if not str(row.get("item_id", "")).isdigit():
+                continue
+            try:
+                html = self._client.get_announcement_page(row["cv_cid"], row["item_id"])
+            except MCVError as exc:
+                log.debug("no announcement page for %s: %s", row["id"], exc)
+                row["body"] = known.get(row["id"], "")
+                continue
+            row["body"] = parse_announcement_body(html)
 
 
 class Poller:

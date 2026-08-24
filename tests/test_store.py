@@ -132,6 +132,49 @@ def test_courses_are_keyed_by_cv_cid(store):
     assert store.query("SELECT title FROM courses")[0]["title"] == "Computer Networks I"
 
 
+def test_announcements_are_tracked_like_everything_else(store):
+    ann = {
+        "id": "100:9",
+        "cv_cid": "100",
+        "item_id": "9",
+        "title": "Quiz moved to Friday",
+        "body": "",
+        "posted_at": "2026-08-17T17:00:00+00:00",
+        "posted_text": "18 Aug 26",
+        "url": "https://mcv.test/course/100/view_content_node_9",
+    }
+    assert store.upsert("announcements", [ann])["added"] == 1
+    events = store.events_since("2000-01-01T00:00:00+00:00")
+    assert [e["kind"] for e in events] == ["announcement_new"]
+    assert events[0]["summary"] == "Quiz moved to Friday"
+
+    # An edited body (the syncer refetches on full sync) is a change event.
+    counts = store.upsert("announcements", [{**ann, "body": "Now in room 301."}])
+    assert counts == {"added": 0, "changed": 1, "unchanged": 0}
+
+
+def test_quiet_tables_backfill_without_events(store):
+    """A table introduced after the initial sync backfills silently via quiet_tables."""
+    ann = {
+        "id": "100:9",
+        "cv_cid": "100",
+        "item_id": "9",
+        "title": "Old announcement",
+        "body": "",
+        "posted_at": None,
+        "posted_text": "01 Jul 26",
+        "url": "https://mcv.test/course/100/view_content_node_9",
+    }
+    store.apply_sync({"announcements": [ann]}, quiet_tables=("announcements",))
+    assert store.events_since("2000-01-01T00:00:00+00:00") == []
+
+    # Later rows arrive with events on again.
+    newer = {**ann, "id": "100:10", "item_id": "10", "title": "Fresh news"}
+    store.apply_sync({"announcements": [ann, newer]})
+    events = store.events_since("2000-01-01T00:00:00+00:00")
+    assert [e["ref_id"] for e in events] == ["100:10"]
+
+
 def test_sync_run_records_failure(store):
     run_id = store.start_sync()
     store.finish_sync(run_id, status="error", error="boom")

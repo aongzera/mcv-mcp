@@ -71,9 +71,10 @@ server-rendered, so an authenticated `GET` returns the full markup:
 | URL | Contains | Parsed by |
 |---|---|---|
 | `/?q=courseville` | `<select id="all-yearsem-select">` — the semester codes | `client.get_semesters` |
-| `/?q=courseville/course/<cv_cid>` | course home: **materials**, with direct S3 file links | `parse_materials` |
+| `/?q=courseville/course/<cv_cid>` | course home: **announcements list** and **materials** (direct S3 file links) | `parse_announcements`, `parse_materials` |
 | `/?q=courseville/course/<cv_cid>/assignment` | **assignment list** with out/due dates | `parse_assignments` |
 | `/?q=courseville/course/<cv_cid>/portfolio-<student id>` | **graded items and scores** | `parse_grades` |
+| `/?q=courseville/course/<cv_cid>/view_content_node_<content id>` | one announcement's **full text** | `parse_announcement_body` |
 | `/?q=courseville/worksheet/<cv_cid>/<item id>` | one assignment's **instruction text** | `parse_worksheet_description` |
 
 Other tabs exist and are unused: `map`, `media_gallery`, `playlist`, `wlrlist`, `schedule`,
@@ -91,6 +92,8 @@ Other tabs exist and are unused: `map`, `media_gallery`, `playlist`, `wlrlist`, 
 | Grade row | `#courseville-portfolio-gradeditem-table tr[content_id]`; skip `.courseville-point-table-total-row` |
 | Grade max score | third cell's `.sr-only` → `"from 30"` |
 | Assignment description | `#courseville-worksheet-instruction-body` |
+| Announcement row | `#courseville-announcement-list tr`; date from `.courseville-post-date` (`18 Aug 26`, no time), stable id from the link's `content_id` attr, full title from its `aria-label` (`View announcement titled …`) |
+| Announcement body | the `view_content_node` page has no dedicated id; anchor on `.courseville-view-content-modification-info` / `.courseville-content-panel-acknowledge-div` and take their parent `<section>`, minus those two nodes and the section's own title bar |
 
 **Dates:** never scrape the visible date cell — it is a stack of styled divs (`Aug`, `23`,
 `2026`) that concatenates into garbage. The `.sr-only` copy next to it is unambiguous

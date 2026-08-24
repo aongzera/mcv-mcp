@@ -328,6 +328,10 @@ class MCVClient:
         """The student's own portfolio page for a course - this is where scores live."""
         return self.get_course_page(cv_cid, f"portfolio-{self._config.username}")
 
+    def get_announcement_page(self, cv_cid: str | int, content_id: str | int) -> str:
+        """One announcement's own page, which carries its full text."""
+        return self.get_course_page(cv_cid, f"view_content_node_{content_id}")
+
     def get_worksheet_page(self, cv_cid: str | int, item_id: str | int) -> str:
         """One assignment's worksheet, which carries its instruction text."""
         self.ensure_login()
